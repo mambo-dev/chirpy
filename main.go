@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/mambo-dev/chirpy/internal/auth"
 	"github.com/mambo-dev/chirpy/internal/database"
 )
 
@@ -42,6 +43,7 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", apiConfig.getChirps)
 	mux.HandleFunc("POST /api/chirps", apiConfig.createChirp)
 	mux.HandleFunc("POST /api/users", apiConfig.createUsers)
+	mux.HandleFunc("POST /api/login", apiConfig.login)
 	handler := http.StripPrefix("/", http.FileServer(http.Dir(".")))
 	mux.HandleFunc("GET /admin/metrics", apiConfig.getMetrics)
 	mux.HandleFunc("POST /admin/reset", apiConfig.reset)
@@ -206,15 +208,52 @@ func validateChirp(chirp string) (string, error, int) {
 
 }
 
-func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
+func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 	type Params struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
 	params := &Params{}
 
-	err := decoder.Decode(&params)
+	err := decoder.Decode(params)
+
+	if err != nil {
+
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+	email := params.Email
+
+	user, err := cfg.dbQueries.GetUserByEmail(req.Context(), email)
+
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
+		return
+	}
+
+	err = auth.CheckPasswordHash(user.HashedPassword, params.Password)
+
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, user)
+	return
+}
+
+func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
+	type Params struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	decoder := json.NewDecoder(req.Body)
+	params := &Params{}
+
+	err := decoder.Decode(params)
 
 	if err != nil {
 
@@ -223,8 +262,23 @@ func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
 	}
 
 	email := params.Email
+	password := params.Password
+	if strings.TrimSpace(password) == "" || strings.TrimSpace(email) == "" {
+		respondWithError(w, http.StatusBadRequest, "password or email should not be blank")
+		return
+	}
 
-	user, err := cfg.dbQueries.CreateUser(req.Context(), email)
+	hash, err := auth.HashPassword(params.Password)
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	user, err := cfg.dbQueries.CreateUser(req.Context(), database.CreateUserParams{
+		Email:          email,
+		HashedPassword: hash,
+	})
 
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "user creation failed")
