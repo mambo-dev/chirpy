@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/mambo-dev/chirpy/internal/database"
@@ -35,7 +37,10 @@ func main() {
 	apiConfig := apiConfig{}
 	apiConfig.dbQueries = dbQueries
 	mux.HandleFunc("GET /api/healthz", ok)
-	mux.HandleFunc("POST /api/validate_chirp", validateChirp)
+
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiConfig.getChirp)
+	mux.HandleFunc("GET /api/chirps", apiConfig.getChirps)
+	mux.HandleFunc("POST /api/chirps", apiConfig.createChirp)
 	mux.HandleFunc("POST /api/users", apiConfig.createUsers)
 	handler := http.StripPrefix("/", http.FileServer(http.Dir(".")))
 	mux.HandleFunc("GET /admin/metrics", apiConfig.getMetrics)
@@ -49,6 +54,87 @@ func main() {
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
+}
+
+func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
+	chirpID := req.PathValue("chirpID")
+
+	chirpUUID, err := uuid.Parse(chirpID)
+	if err != nil {
+		fmt.Printf("FATAL:%v\n", err.Error())
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	chirp, err := cfg.dbQueries.GetChirp(req.Context(), chirpUUID)
+
+	if err != nil {
+		fmt.Printf("ERROR: %v\n", err.Error())
+		respondWithError(w, http.StatusNotFound, "Could not find chirp")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, chirp)
+	return
+}
+
+func (cfg *apiConfig) getChirps(w http.ResponseWriter, req *http.Request) {
+	chirps, err := cfg.dbQueries.GetChirps(req.Context())
+
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "could not return chirps")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, chirps)
+	return
+}
+
+func (cfg *apiConfig) createChirp(w http.ResponseWriter, req *http.Request) {
+	type Params struct {
+		Body   string    `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
+	}
+
+	decoder := json.NewDecoder(req.Body)
+	params := &Params{}
+
+	err := decoder.Decode(params)
+
+	if err != nil {
+		fmt.Printf("FATAL:%v\n", err.Error())
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	validChirp, err, code := validateChirp(params.Body)
+
+	if err != nil {
+		respondWithError(w, code, err.Error())
+		return
+	}
+
+	chirp, err := cfg.dbQueries.CreateChirp(req.Context(), database.CreateChirpParams{
+		Body: validChirp,
+		UserID: uuid.NullUUID{
+			UUID:  params.UserID,
+			Valid: true,
+		},
+	})
+
+	if err != nil {
+		fmt.Printf("ERROR:%v\n", err.Error())
+		respondWithJSON(w, http.StatusBadRequest, reqError{
+			Error: "could not create the chirp",
+		})
+
+		return
+	}
+
+	respondWithJSON(w, http.StatusCreated, chirp)
+
+	return
+
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -74,6 +160,12 @@ func (cfg *apiConfig) getMetrics(w http.ResponseWriter, req *http.Request) {
 
 func (cfg *apiConfig) reset(w http.ResponseWriter, req *http.Request) {
 	cfg.fileserverHits.Swap(0)
+	platform := os.Getenv("PLATFORM")
+	if platform != "dev" {
+		respondWithError(w, http.StatusForbidden, "reset only allowed in dev mode")
+		return
+	}
+	cfg.dbQueries.DeleteUsers(req.Context())
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -93,32 +185,15 @@ type Success struct {
 	CleanedBody string `json:"cleaned_body"`
 }
 
-func validateChirp(w http.ResponseWriter, req *http.Request) {
+func validateChirp(chirp string) (string, error, int) {
 
-	type parameters struct {
-		Body string `json:"body"`
-	}
-	decoder := json.NewDecoder(req.Body)
+	if len(chirp) > 140 {
 
-	params := parameters{}
-
-	err := decoder.Decode(&params)
-
-	if err != nil {
-
-		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
-		return
+		return "", errors.New("Chirp is too long"), http.StatusBadRequest
 	}
 
-	if len(params.Body) > 140 {
-
-		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
-		return
-	}
-
-	body := params.Body
 	newString := []string{}
-	for _, character := range strings.Split(body, " ") {
+	for _, character := range strings.Split(chirp, " ") {
 		stringCharacter := string(character)
 		if strings.ToLower(stringCharacter) == "kerfuffle" || strings.ToLower(stringCharacter) == "sharbert" || strings.ToLower(stringCharacter) == "fornax" {
 			newString = append(newString, "****")
@@ -127,11 +202,7 @@ func validateChirp(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	success := Success{
-		CleanedBody: strings.Join(newString, " "),
-	}
-
-	respondWithJSON(w, http.StatusOK, success)
+	return strings.Join(newString, " "), nil, http.StatusContinue
 
 }
 
@@ -160,7 +231,7 @@ func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, user)
+	respondWithJSON(w, http.StatusCreated, user)
 	return
 }
 
