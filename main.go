@@ -98,8 +98,7 @@ func (cfg *apiConfig) getChirps(w http.ResponseWriter, req *http.Request) {
 
 func (cfg *apiConfig) createChirp(w http.ResponseWriter, req *http.Request) {
 	type Params struct {
-		Body   string    `json:"body"`
-		UserID uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
 	}
 
 	authToken, err := auth.GetBearerToken(req.Header)
@@ -107,6 +106,14 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		fmt.Printf("FATAL:%v\n", err.Error())
 		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(authToken, cfg.JWTSecret)
+
+	if err != nil {
+		fmt.Printf("ERROR:%v\n", err.Error())
+		respondWithError(w, http.StatusUnauthorized, "user is unauthorized")
 		return
 	}
 
@@ -131,7 +138,7 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, req *http.Request) {
 	chirp, err := cfg.dbQueries.CreateChirp(req.Context(), database.CreateChirpParams{
 		Body: validChirp,
 		UserID: uuid.NullUUID{
-			UUID:  params.UserID,
+			UUID:  userID,
 			Valid: true,
 		},
 	})
@@ -222,9 +229,8 @@ func validateChirp(chirp string) (string, error, int) {
 
 func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 	type Params struct {
-		Email     string `json:"email"`
-		Password  string `json:"password"`
-		ExpiresIn string `json:"expires_in_seconds"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -255,10 +261,8 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
 		return
 	}
+
 	expiresIn := "1h"
-	if params.ExpiresIn != "" {
-		expiresIn = params.ExpiresIn
-	}
 	expiresInDuration, err := time.ParseDuration(expiresIn)
 	if err != nil {
 		fmt.Printf("ERROR: Invalid duration provided -> %v", err.Error())
@@ -275,19 +279,42 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 	}
 
 	type UserResponse struct {
-		ID        uuid.UUID `json:"id"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		Email     string    `json:"email"`
-		JWTToken  string    `json:"token"`
+		ID           uuid.UUID `json:"id"`
+		CreatedAt    time.Time `json:"created_at"`
+		UpdatedAt    time.Time `json:"updated_at"`
+		Email        string    `json:"email"`
+		AccessToken  string    `json:"access_token"`
+		RefreshToken string    `json:"refresh_token"`
+	}
+
+	refreshToken, err := auth.MakeRefreshToken()
+	if err != nil {
+		fmt.Printf("ERROR: failed to generate refresh token-> %v", err.Error())
+		respondWithError(w, http.StatusInternalServerError, "Failed to generate refresh token ")
+		return
+	}
+
+	savedRefreshToken, err := cfg.dbQueries.CreateRefreshToken(req.Context(), database.CreateRefreshTokenParams{
+		Token: refreshToken,
+		UserID: uuid.NullUUID{
+			UUID:  user.ID,
+			Valid: true,
+		},
+	})
+
+	if err != nil {
+		fmt.Printf("ERROR: failed to save refresh token-> %v", err.Error())
+		respondWithError(w, http.StatusInternalServerError, "Failed to save refresh token ")
+		return
 	}
 
 	respondWithJSON(w, http.StatusOK, UserResponse{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
-		JWTToken:  JWTToken,
+		ID:           user.ID,
+		CreatedAt:    user.CreatedAt,
+		UpdatedAt:    user.UpdatedAt,
+		Email:        user.Email,
+		AccessToken:  JWTToken,
+		RefreshToken: savedRefreshToken.Token,
 	})
 	return
 }
