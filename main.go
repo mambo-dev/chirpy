@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -21,6 +22,7 @@ import (
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
+	JWTSecret := os.Getenv("JWT_SECRET")
 	mux := http.NewServeMux()
 	server := &http.Server{
 		Handler: mux,
@@ -36,6 +38,7 @@ func main() {
 	dbQueries := database.New(db)
 
 	apiConfig := apiConfig{}
+	apiConfig.JWTSecret = JWTSecret
 	apiConfig.dbQueries = dbQueries
 	mux.HandleFunc("GET /api/healthz", ok)
 
@@ -56,6 +59,7 @@ func main() {
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
+	JWTSecret      string
 }
 
 func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
@@ -98,10 +102,18 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, req *http.Request) {
 		UserID uuid.UUID `json:"user_id"`
 	}
 
+	authToken, err := auth.GetBearerToken(req.Header)
+
+	if err != nil {
+		fmt.Printf("FATAL:%v\n", err.Error())
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
 	decoder := json.NewDecoder(req.Body)
 	params := &Params{}
 
-	err := decoder.Decode(params)
+	err = decoder.Decode(params)
 
 	if err != nil {
 		fmt.Printf("FATAL:%v\n", err.Error())
@@ -210,8 +222,9 @@ func validateChirp(chirp string) (string, error, int) {
 
 func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 	type Params struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email     string `json:"email"`
+		Password  string `json:"password"`
+		ExpiresIn string `json:"expires_in_seconds"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -220,27 +233,62 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 	err := decoder.Decode(params)
 
 	if err != nil {
-
+		fmt.Printf("ERROR: failed to decode params %v\n", err.Error())
 		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
 		return
 	}
+
 	email := params.Email
 
 	user, err := cfg.dbQueries.GetUserByEmail(req.Context(), email)
 
 	if err != nil {
+		fmt.Printf("ERROR: invalid email-> %v", err.Error())
 		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
 		return
 	}
 
-	err = auth.CheckPasswordHash(user.HashedPassword, params.Password)
+	err = auth.CheckPasswordHash(params.Password, user.HashedPassword)
 
 	if err != nil {
+		fmt.Printf("ERROR: invalid password-> %v", err.Error())
 		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
 		return
 	}
+	expiresIn := "1h"
+	if params.ExpiresIn != "" {
+		expiresIn = params.ExpiresIn
+	}
+	expiresInDuration, err := time.ParseDuration(expiresIn)
+	if err != nil {
+		fmt.Printf("ERROR: Invalid duration provided -> %v", err.Error())
+		respondWithError(w, http.StatusInternalServerError, "Invalid expires in duration")
+		return
+	}
 
-	respondWithJSON(w, http.StatusOK, user)
+	JWTToken, err := auth.MakeJWT(user.ID, cfg.JWTSecret, expiresInDuration)
+
+	if err != nil {
+		fmt.Printf("ERROR: failed to get token-> %v", err.Error())
+		respondWithError(w, http.StatusInternalServerError, "Failed to provide jwt ")
+		return
+	}
+
+	type UserResponse struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+		JWTToken  string    `json:"token"`
+	}
+
+	respondWithJSON(w, http.StatusOK, UserResponse{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+		JWTToken:  JWTToken,
+	})
 	return
 }
 
@@ -256,7 +304,7 @@ func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
 	err := decoder.Decode(params)
 
 	if err != nil {
-
+		fmt.Printf("Failed to decode params -> %v", err.Error())
 		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
 		return
 	}
@@ -271,6 +319,7 @@ func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
 	hash, err := auth.HashPassword(params.Password)
 
 	if err != nil {
+		fmt.Printf("User creation failed error -> %v", err.Error())
 		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
 		return
 	}
@@ -281,6 +330,7 @@ func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
 	})
 
 	if err != nil {
+		fmt.Printf("User creation failed error -> %v", err.Error())
 		respondWithError(w, http.StatusInternalServerError, "user creation failed")
 		return
 	}
