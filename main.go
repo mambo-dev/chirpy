@@ -47,6 +47,8 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", apiConfig.createChirp)
 	mux.HandleFunc("POST /api/users", apiConfig.createUsers)
 	mux.HandleFunc("POST /api/login", apiConfig.login)
+	mux.HandleFunc("POST /api/refresh", apiConfig.refresh)
+	mux.HandleFunc("POST /api/revoke", apiConfig.revoke)
 	handler := http.StripPrefix("/", http.FileServer(http.Dir(".")))
 	mux.HandleFunc("GET /admin/metrics", apiConfig.getMetrics)
 	mux.HandleFunc("POST /admin/reset", apiConfig.reset)
@@ -283,7 +285,7 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 		CreatedAt    time.Time `json:"created_at"`
 		UpdatedAt    time.Time `json:"updated_at"`
 		Email        string    `json:"email"`
-		AccessToken  string    `json:"access_token"`
+		AccessToken  string    `json:"token"`
 		RefreshToken string    `json:"refresh_token"`
 	}
 
@@ -294,10 +296,24 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	refreshExpiresIn, err := time.ParseDuration("1440h")
+
+	if err != nil {
+		fmt.Printf("FATAL: failed to parse duration-> %v", err.Error())
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong ")
+		return
+	}
+
+	fmt.Println(time.Now().Add(refreshExpiresIn))
+
 	savedRefreshToken, err := cfg.dbQueries.CreateRefreshToken(req.Context(), database.CreateRefreshTokenParams{
 		Token: refreshToken,
 		UserID: uuid.NullUUID{
 			UUID:  user.ID,
+			Valid: true,
+		},
+		ExpiresAt: sql.NullTime{
+			Time:  time.Now().Add(refreshExpiresIn),
 			Valid: true,
 		},
 	})
@@ -316,6 +332,102 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 		AccessToken:  JWTToken,
 		RefreshToken: savedRefreshToken.Token,
 	})
+	return
+}
+
+func (cfg *apiConfig) refresh(w http.ResponseWriter, req *http.Request) {
+	authHeader := req.Header.Get("Authorization")
+
+	if len(authHeader) < 1 {
+		fmt.Printf("ERROR: failed to get refresh token in headers")
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	refreshToken := strings.Split(authHeader, " ")[1]
+
+	if len(refreshToken) < 1 {
+		fmt.Printf("ERROR: failed to get refresh token in headers instead got %v\n", refreshToken)
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	savedRefreshToken, err := cfg.dbQueries.GetRefreshToken(req.Context(), refreshToken)
+
+	if err != nil {
+		fmt.Printf("ERROR: failed to get refresh token in database instead got %v\n", err.Error())
+		respondWithError(w, http.StatusUnauthorized, "could not get refresh token")
+		return
+
+	}
+
+	if savedRefreshToken.RevokedAt.Valid {
+		fmt.Printf("ERROR: refresh token revoked")
+		respondWithError(w, http.StatusUnauthorized, "refresh token was revoked")
+		return
+	}
+
+	expiresAt := savedRefreshToken.ExpiresAt.Time
+	if time.Now().After(expiresAt) {
+		fmt.Printf("ERROR: refresh token expired at %v\n", expiresAt)
+		respondWithError(w, http.StatusUnauthorized, "refresh token is expired")
+		return
+	}
+
+	expiresIn := "1h"
+	expiresInDuration, err := time.ParseDuration(expiresIn)
+	if err != nil {
+		fmt.Printf("ERROR: Invalid duration provided -> %v", err.Error())
+		respondWithError(w, http.StatusInternalServerError, "Invalid expires in duration")
+		return
+	}
+
+	JWTToken, err := auth.MakeJWT(savedRefreshToken.UserID.UUID, cfg.JWTSecret, expiresInDuration)
+
+	if err != nil {
+		fmt.Printf("ERROR: failed to get token-> %v", err.Error())
+		respondWithError(w, http.StatusInternalServerError, "Failed to provide jwt ")
+		return
+	}
+
+	tokenResponse := struct {
+		Token string `json:"token"`
+	}{
+		Token: JWTToken,
+	}
+
+	respondWithJSON(w, http.StatusOK, tokenResponse)
+	return
+}
+
+func (cfg *apiConfig) revoke(w http.ResponseWriter, req *http.Request) {
+	authHeader := req.Header.Get("Authorization")
+
+	if len(authHeader) < 1 {
+		fmt.Printf("ERROR: failed to get refresh token in headers")
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	refreshToken := strings.Split(authHeader, " ")[1]
+
+	if len(refreshToken) < 1 {
+		fmt.Printf("ERROR: failed to get refresh token in headers instead got %v\n", refreshToken)
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	err := cfg.dbQueries.RevokeRefreshToken(req.Context(), refreshToken)
+
+	if err != nil {
+		fmt.Printf("FATAL: failed to revoke refresh token %v\n", err.Error())
+		respondWithError(w, http.StatusUnauthorized, "could not revoke refresh token")
+		return
+
+	}
+
+	respondWithJSON(w, http.StatusNoContent, nil)
+
 	return
 }
 
@@ -383,6 +495,12 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
 }
 
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+
+	if code == http.StatusNoContent {
+		w.WriteHeader(code)
+		return
+	}
+
 	data, err := json.Marshal(payload)
 
 	if err != nil {
