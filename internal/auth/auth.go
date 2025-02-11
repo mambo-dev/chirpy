@@ -92,6 +92,22 @@ func GetBearerToken(headers http.Header) (string, error) {
 
 }
 
+func GetAPIKey(headers http.Header) (string, error) {
+	authHeader := headers.Get("Authorization")
+
+	if len(authHeader) < 1 {
+		return "", errors.New("did not get authorization header")
+	}
+
+	authString := strings.Split(authHeader, " ")[1]
+
+	if len(authString) < 1 {
+		return "", errors.New("Invalid format")
+	}
+
+	return authString, nil
+}
+
 func MakeRefreshToken() (string, error) {
 	bt := make([]byte, 32)
 

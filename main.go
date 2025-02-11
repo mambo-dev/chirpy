@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,7 @@ func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	JWTSecret := os.Getenv("JWT_SECRET")
+	PolkaKey := os.Getenv("POLKA_KEY")
 	mux := http.NewServeMux()
 	server := &http.Server{
 		Handler: mux,
@@ -40,6 +42,7 @@ func main() {
 	apiConfig := apiConfig{}
 	apiConfig.JWTSecret = JWTSecret
 	apiConfig.dbQueries = dbQueries
+	apiConfig.PolkaKey = PolkaKey
 	mux.HandleFunc("GET /api/healthz", ok)
 
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiConfig.getChirp)
@@ -51,6 +54,7 @@ func main() {
 	mux.HandleFunc("POST /api/login", apiConfig.login)
 	mux.HandleFunc("POST /api/refresh", apiConfig.refresh)
 	mux.HandleFunc("POST /api/revoke", apiConfig.revoke)
+	mux.HandleFunc("POST /api/polka/webhooks", apiConfig.webHooks)
 
 	handler := http.StripPrefix("/", http.FileServer(http.Dir(".")))
 	mux.HandleFunc("GET /admin/metrics", apiConfig.getMetrics)
@@ -65,6 +69,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
 	JWTSecret      string
+	PolkaKey       string
 }
 
 func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
@@ -90,10 +95,48 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
 }
 
 func (cfg *apiConfig) getChirps(w http.ResponseWriter, req *http.Request) {
+	authorID := req.URL.Query().Get("author_id")
+	sortMethod := req.URL.Query().Get("sort")
+	sortBy := "asc"
+
+	if len(sortMethod) > 1 {
+		sortBy = sortMethod
+	}
+
 	chirps, err := cfg.dbQueries.GetChirps(req.Context())
+
+	if sortBy == "desc" {
+		sort.Slice(chirps, func(i, j int) bool { return chirps[i].CreatedAt.After(chirps[j].CreatedAt) })
+	} else {
+		sort.Slice(chirps, func(i, j int) bool { return chirps[i].CreatedAt.Before(chirps[j].CreatedAt) })
+	}
 
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "could not return chirps")
+		return
+	}
+
+	if len(authorID) > 0 {
+		authorUID, err := uuid.Parse(authorID)
+
+		chirps, err := cfg.dbQueries.GetAuthorChirps(req.Context(), uuid.NullUUID{
+			UUID:  authorUID,
+			Valid: true,
+		})
+
+		if err != nil {
+			fmt.Printf("ERROR:%v\n", err.Error())
+			respondWithError(w, http.StatusBadRequest, "could not return author's chirps")
+			return
+		}
+
+		if sortBy == "desc" {
+			sort.Slice(chirps, func(i, j int) bool { return chirps[i].CreatedAt.After(chirps[j].CreatedAt) })
+		} else {
+			sort.Slice(chirps, func(i, j int) bool { return chirps[i].CreatedAt.Before(chirps[j].CreatedAt) })
+		}
+
+		respondWithJSON(w, http.StatusOK, chirps)
 		return
 	}
 
@@ -171,16 +214,6 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	})
 }
 
-func getUserID(r *http.Request) (uuid.UUID, error) {
-	userID, ok := r.Context().Value("userID").(uuid.UUID)
-
-	if !ok {
-		return uuid.New(), errors.New("could not retrieve user id ")
-	}
-
-	return userID, nil
-}
-
 func (cfg *apiConfig) getMetrics(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	htmlData := fmt.Sprintf(`<html>
@@ -218,6 +251,16 @@ type reqError struct {
 
 type Success struct {
 	CleanedBody string `json:"cleaned_body"`
+}
+
+type UserResponse struct {
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	AccessToken  string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 func validateChirp(chirp string) (string, error, int) {
@@ -292,15 +335,6 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	type UserResponse struct {
-		ID           uuid.UUID `json:"id"`
-		CreatedAt    time.Time `json:"created_at"`
-		UpdatedAt    time.Time `json:"updated_at"`
-		Email        string    `json:"email"`
-		AccessToken  string    `json:"token"`
-		RefreshToken string    `json:"refresh_token"`
-	}
-
 	refreshToken, err := auth.MakeRefreshToken()
 	if err != nil {
 		fmt.Printf("ERROR: failed to generate refresh token-> %v", err.Error())
@@ -343,6 +377,7 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 		Email:        user.Email,
 		AccessToken:  JWTToken,
 		RefreshToken: savedRefreshToken.Token,
+		IsChirpyRed:  user.IsChirpyRed,
 	})
 	return
 }
@@ -486,7 +521,21 @@ func (cfg *apiConfig) createUsers(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	respondWithJSON(w, http.StatusCreated, user)
+	type CreatedResponse struct {
+		ID          uuid.UUID `json:"id"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
+		Email       string    `json:"email"`
+		IsChirpyRed bool      `json:"is_chirpy_red"`
+	}
+	respondWithJSON(w, http.StatusCreated, CreatedResponse{
+		ID:          user.ID,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Email:       user.Email,
+		IsChirpyRed: user.IsChirpyRed,
+	})
+
 	return
 }
 
@@ -585,6 +634,56 @@ func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, req *http.Request) {
 
 	return
 
+}
+
+func (cfg *apiConfig) webHooks(w http.ResponseWriter, req *http.Request) {
+	type Params struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID uuid.UUID `json:"user_id"`
+		} `json:"data"`
+	}
+
+	apiKey, err := auth.GetAPIKey(req.Header)
+
+	if err != nil {
+		fmt.Printf("ERROR:%v\n", err.Error())
+		respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	if apiKey != cfg.PolkaKey {
+		fmt.Printf("ERROR:%v\n", "Invalid api key")
+		respondWithError(w, http.StatusUnauthorized, "Invalid api key")
+		return
+	}
+
+	decoder := json.NewDecoder(req.Body)
+
+	params := &Params{}
+
+	err = decoder.Decode(params)
+
+	if err != nil {
+		fmt.Printf("FATAL:%v\n", err.Error())
+		respondWithJSON(w, http.StatusNoContent, nil)
+		return
+	}
+
+	if params.Event != "user.upgraded" {
+		respondWithJSON(w, http.StatusNoContent, nil)
+		return
+	}
+
+	err = cfg.dbQueries.UpdateUserAccount(req.Context(), params.Data.UserID)
+
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "User was not found.")
+		return
+	}
+
+	respondWithJSON(w, http.StatusNoContent, nil)
+	return
 }
 
 func respondWithError(w http.ResponseWriter, code int, msg string) {
